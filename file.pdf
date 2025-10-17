@@ -1,56 +1,30 @@
-%PDF-1.0
-1 0 obj
-<<
-/Type /Catalog
-%/OpenAction
-/Pages 1 0 R
->>
+%PDF-1.7
+1 0 obj<</Type/Catalog/Pages 2 0 R>>
 endobj
-
-2 0 obj
-<<
-/Type /Pages
-/Count 1
-/Kids [3 0 R]
->>
+2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>
 endobj
-
-3 0 obj
-<<
-/Type /Page
-/Parent 2 0 R
-/Resources << /Font << /F1 5 0 R >>
->>
-/MediaBox [0 0 612 792]
-/Contents 4 0 R
->>
+3 0 obj<</Type/Page/Parent 2 0 R/Contents 5 0 R/Resources <</Font <</F1 4 0 R>>>>/MediaBox[0 0 595 842]>>
 endobj
-
-4 0 obj
-<< /Length 45 >>
-stream
+4 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>
+endobj
+5 0 obj<</Length 43>>stream
 BT
-/F1 24 Tf
-250 700 Td {Hello, World!} Tj
+/F1 16 Tf
+42 770 Td
+(Hello world!!)Tj
 ET
 endstream
 endobj
-
-5 0 obj
-<<
-/Type /Font
-/Subtype /Type1
-/BaseFont /Helvetica
->>
+6 0 obj<</Root 1 0 R/Type/Xref/W[1 2 2]/Size 7/Length 90/Filter/ASCIIHexDecode>>stream
+00 0000 FFFF
+01 0009 0000
+01 0035 0000
+01 0067 0000
+01 00D8 0000
+01 0116 0000
+01 016F 0000
+endstream
 endobj
-
-xref
-0 6
-trailer
-<<
-/Size 6
-/Root 1 0 R
->>
 startxref
-
+367
 %%EOF
